@@ -61,5 +61,7 @@ ml/*.parquet
 ml/*.pkl
 ml/*.h5
 ml/*.ckpt
+ml/model.json
+ml/feature_order.json
 ml/data/
 ml/checkpoints/
