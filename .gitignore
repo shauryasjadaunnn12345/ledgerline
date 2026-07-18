@@ -55,11 +55,11 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
-# ---- ML artifacts (optional: uncomment if you don't want to track large files) ----
-# *.csv
-# *.parquet
-# *.pkl
-# *.h5
-# *.ckpt
-# ml/data/
-# ml/checkpoints/
+# ---- ML artifacts (generated data/models; scripts in ml/ are still tracked) ----
+ml/*.csv
+ml/*.parquet
+ml/*.pkl
+ml/*.h5
+ml/*.ckpt
+ml/data/
+ml/checkpoints/
