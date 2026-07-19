@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.routers import health, items
+from backend.database import Base, engine
+from backend.routers import dashboard, disputes, health, items
 
 app = FastAPI(title="Backend API")
 
@@ -16,6 +17,15 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(items.router)
+app.include_router(disputes.router)
+app.include_router(dashboard.router)
+
+
+@app.on_event("startup")
+def on_startup():
+    """Create all tables if they don't already exist (SQLite dev DB by
+    default; set DATABASE_URL for Postgres/etc in other environments)."""
+    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/")
