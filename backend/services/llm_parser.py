@@ -2,7 +2,11 @@
 llm_parser.py
 
 Uses the Mistral API's chat completions endpoint to extract structured
-fields from free-text dispute evidence submissions.
+fields from free-text dispute evidence submissions, including
+signature_confirmation and policy_compliance -- used by the resolve
+pipeline's feature-vector construction (with a keyword-based fallback in
+evidence_signals.py when these come back null, e.g. because the LLM isn't
+configured or couldn't parse the response).
 
 Requires MISTRAL_API_KEY to be set, either as an environment variable or in
 a .env file in the current working directory (loaded via python-dotenv).
@@ -22,9 +26,15 @@ MODEL = "mistral-small-latest"
 SYSTEM_PROMPT = (
     "You are a data extraction engine. Extract the following fields from the "
     "dispute evidence text: date, amount, tracking_number, delivery_status, "
-    "invoice_present (bool), refund_policy_match (bool). If a field cannot be "
-    "found, return null for it. Return ONLY a valid JSON object, no "
-    "explanation, no markdown formatting, no code fences."
+    "invoice_present (bool), refund_policy_match (bool), signature_confirmation "
+    "(bool -- true only if the text indicates a signature or delivery "
+    "confirmation was actually obtained/on file; false if it explicitly says "
+    "no signature was obtained; null if not mentioned), policy_compliance "
+    "(bool -- true only if the text indicates the merchant complied with its "
+    "own stated policy, e.g. return/refund policy; false if it indicates a "
+    "policy violation; null if not mentioned). If a field cannot be found, "
+    "return null for it. Return ONLY a valid JSON object, no explanation, no "
+    "markdown formatting, no code fences."
 )
 
 JSON_ONLY_REMINDER = "Return valid JSON only, nothing else."
@@ -69,8 +79,9 @@ def _try_parse_json(text: str):
 def parse_evidence(raw_text: str) -> dict:
     """
     Extract structured fields (date, amount, tracking_number,
-    delivery_status, invoice_present, refund_policy_match) from raw dispute
-    evidence text using the Mistral API.
+    delivery_status, invoice_present, refund_policy_match,
+    signature_confirmation, policy_compliance) from raw dispute evidence
+    text using the Mistral API.
 
     Retries once with an added JSON-only reminder if the first response
     isn't valid JSON. If it still isn't valid JSON, returns

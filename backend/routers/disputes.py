@@ -21,7 +21,7 @@ from backend.models.schemas import (
     EvidenceOut,
     StatusOut,
 )
-from backend.services import llm_parser, ml_service, rule_engine
+from backend.services import evidence_signals, llm_parser, ml_service, rule_engine
 
 router = APIRouter(prefix="/disputes", tags=["disputes"])
 
@@ -96,23 +96,55 @@ def _build_feature_vector(
     db: Session, dispute: Dispute, evidence_list: List[Evidence], evidence_completeness_pct: float
 ) -> dict:
     """Reconstruct the model's raw feature vector from stored/parsed
-    evidence, with sensible defaults for anything not yet captured."""
+    evidence, with sensible defaults for anything not yet captured.
+
+    has_tracking: True if any evidence's parsed_fields includes a
+    tracking_number.
+
+    has_signature_confirmation: prefers the LLM's explicit
+    signature_confirmation field (from any submitter); if that field is
+    null/missing (LLM not configured, parse failure, or field simply not
+    extracted), falls back to keyword detection over that evidence's
+    raw_text + delivery_status via evidence_signals.
+
+    merchant_policy_compliance: same idea, but only evidence submitted by
+    the merchant (submitted_by == "merchant") is considered, since this
+    signal is specifically about the merchant's own conduct.
+    """
 
     has_tracking = False
     has_signature_confirmation = False
+    merchant_policy_compliance = False
 
     for ev in evidence_list:
-        fields = ev.parsed_fields or {}
-        if not isinstance(fields, dict):
-            continue
+        fields = ev.parsed_fields if isinstance(ev.parsed_fields, dict) else {}
 
         tracking_number = fields.get("tracking_number")
         if tracking_number not in (None, "null", ""):
             has_tracking = True
 
-        delivery_status = fields.get("delivery_status")
-        if isinstance(delivery_status, str) and "signature" in delivery_status.lower():
+        # --- Signature / delivery confirmation ---
+        explicit_signature = fields.get("signature_confirmation")
+        if explicit_signature is True:
             has_signature_confirmation = True
+        elif explicit_signature is None:
+            delivery_status = fields.get("delivery_status")
+            text_to_scan = " ".join(
+                part for part in [ev.raw_text, delivery_status] if isinstance(part, str)
+            )
+            if evidence_signals.detect_signature_confirmation(text_to_scan):
+                has_signature_confirmation = True
+        # explicit_signature is False -> LLM found an explicit "no signature"
+        # signal; treat as authoritative and don't fall back to keywords.
+
+        # --- Merchant policy compliance (merchant-submitted evidence only) ---
+        if ev.submitted_by == "merchant":
+            explicit_compliance = fields.get("policy_compliance")
+            if explicit_compliance is True:
+                merchant_policy_compliance = True
+            elif explicit_compliance is None:
+                if evidence_signals.detect_policy_compliance(ev.raw_text or ""):
+                    merchant_policy_compliance = True
 
     # We do have real history for this: count the card member's other disputes.
     dispute_history_count = (
@@ -122,10 +154,9 @@ def _build_feature_vector(
     )
     dispute_history_count = min(dispute_history_count, 10)
 
-    # Not yet tracked end-to-end (no merchant response event or merchant
-    # policy-compliance signal in the DB yet) -- sensible neutral defaults.
+    # Not yet tracked end-to-end (no merchant response event in the DB yet)
+    # -- sensible neutral default.
     merchant_response_time_hours = 48.0
-    merchant_policy_compliance = False
 
     return {
         "reason_code": dispute.reason_code,
