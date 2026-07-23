@@ -98,8 +98,16 @@ def _build_feature_vector(
     """Reconstruct the model's raw feature vector from stored/parsed
     evidence, with sensible defaults for anything not yet captured.
 
-    has_tracking: True if any evidence's parsed_fields includes a
-    tracking_number.
+    has_tracking: True only if at least one evidence item has a
+    tracking_number that (a) passes a plausibility check -- rejects
+    empty/placeholder/garbage values like "wrong", "123456", "n/a" via
+    evidence_signals.is_plausible_tracking_number, including a check for
+    "this tracking number is wrong" language elsewhere in the same
+    evidence's raw_text -- and (b) isn't contradicted by a delivery_status
+    that indicates the package was NOT actually delivered (e.g. "in
+    transit", "lost", "returned to sender"). A tracking number that proves
+    non-delivery supports the card member's case, not the merchant's, so
+    it must not set has_tracking = True.
 
     has_signature_confirmation: prefers the LLM's explicit
     signature_confirmation field (from any submitter); if that field is
@@ -119,16 +127,19 @@ def _build_feature_vector(
     for ev in evidence_list:
         fields = ev.parsed_fields if isinstance(ev.parsed_fields, dict) else {}
 
+        # --- Tracking: must be a plausible number AND not contradicted by
+        # a "not actually delivered" status. ---
         tracking_number = fields.get("tracking_number")
-        if tracking_number not in (None, "null", ""):
-            has_tracking = True
+        delivery_status = fields.get("delivery_status")
+        if evidence_signals.is_plausible_tracking_number(tracking_number, ev.raw_text or ""):
+            if evidence_signals.is_delivery_confirmed(delivery_status):
+                has_tracking = True
 
         # --- Signature / delivery confirmation ---
         explicit_signature = fields.get("signature_confirmation")
         if explicit_signature is True:
             has_signature_confirmation = True
         elif explicit_signature is None:
-            delivery_status = fields.get("delivery_status")
             text_to_scan = " ".join(
                 part for part in [ev.raw_text, delivery_status] if isinstance(part, str)
             )
