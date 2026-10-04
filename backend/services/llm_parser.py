@@ -4,24 +4,28 @@ llm_parser.py
 Uses the Mistral API's chat completions endpoint to extract structured
 fields from free-text dispute evidence submissions, including
 signature_confirmation and policy_compliance -- used by the resolve
-pipeline's feature-vector construction (with a keyword-based fallback in
-evidence_signals.py when these come back null, e.g. because the LLM isn't
-configured or couldn't parse the response).
+pipeline's text evidence parser.
 
-Requires MISTRAL_API_KEY to be set, either as an environment variable or in
-a .env file in the current working directory (loaded via python-dotenv).
+Uses OPENROUTER_API_KEY and OPENROUTER_MODEL when configured; otherwise falls
+back to MISTRAL_API_KEY. Values may be set in the environment or backend/.env.
 """
 
 import json
+import logging
 import os
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
-MODEL = "mistral-small-latest"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+MISTRAL_MODEL = "mistral-small-latest"
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a data extraction engine. Extract the following fields from the "
@@ -40,15 +44,26 @@ SYSTEM_PROMPT = (
 JSON_ONLY_REMINDER = "Return valid JSON only, nothing else."
 
 
-def _call_mistral(messages: list[dict]) -> str:
-    """Send a chat completion request to the Mistral API and return the
-    raw text content of the model's reply."""
+def _call_llm(messages: list[dict]) -> str:
+    """Send a chat completion request to the configured provider."""
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    mistral_api_key = os.getenv("MISTRAL_API_KEY")
+    if openrouter_api_key:
+        api_key = openrouter_api_key
+        api_url = OPENROUTER_API_URL
+        model = os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
+    elif mistral_api_key:
+        api_key = mistral_api_key
+        api_url = MISTRAL_API_URL
+        model = MISTRAL_MODEL
+    else:
+        raise RuntimeError(
+            "Set OPENROUTER_API_KEY or MISTRAL_API_KEY in the environment or backend/.env."
+        )
 
-    api_key = os.getenv("MISTRAL_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "MISTRAL_API_KEY is not set. Add it to your environment or to a "
-            ".env file in the working directory."
+            "The configured LLM API key is empty."
         )
 
     headers = {
@@ -56,12 +71,12 @@ def _call_mistral(messages: list[dict]) -> str:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "temperature": 0,
     }
 
-    response = requests.post(MISTRAL_API_URL, headers=headers, json=payload, timeout=30)
+    response = requests.post(api_url, headers=headers, json=payload, timeout=30)
     response.raise_for_status()
 
     data = response.json()
@@ -93,7 +108,7 @@ def parse_evidence(raw_text: str) -> dict:
         {"role": "user", "content": raw_text},
     ]
 
-    content = _call_mistral(messages)
+    content = _call_llm(messages)
     parsed = _try_parse_json(content)
     if parsed is not None:
         return parsed
@@ -103,12 +118,101 @@ def parse_evidence(raw_text: str) -> dict:
         {"role": "assistant", "content": content},
         {"role": "user", "content": JSON_ONLY_REMINDER},
     ]
-    retry_content = _call_mistral(retry_messages)
+    retry_content = _call_llm(retry_messages)
     parsed = _try_parse_json(retry_content)
     if parsed is not None:
         return parsed
 
     return {"parse_error": True, "raw_response": retry_content}
+
+
+def interpret_billing_case(
+    evidence: list, calculation: dict, dispute_description: str | None = None
+) -> tuple[str, dict | None]:
+    """Return optional, source-cited interpretation without doing arithmetic."""
+    if os.getenv("BILLING_AI_ENABLED", "true").lower() not in {"1", "true", "yes", "on"}:
+        return "disabled", None
+    if not evidence:
+        return "insufficient_evidence", None
+
+    source_ids = {f"BE-{item.id}" for item in evidence}
+    records = [
+        {"source_id": f"BE-{item.id}", "type": item.evidence_type, "data": item.payload}
+        for item in evidence
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You investigate disputed invoices. Explain only possible causes supported by the supplied records. "
+                "Do not calculate, recompute, or propose monetary amounts. Distinguish arithmetic discrepancies "
+                "from unclear contract interpretation. Every summary and possible cause must cite one or more exact "
+                "source_id values from the input. Ask concise questions for missing evidence. Return JSON only with "
+                "keys summary, summary_citations, possible_causes (objects with category, explanation, citations), "
+                "and follow_up_questions (strings). Categories are calculation_error, contract_interpretation, or other."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps({
+                "customer_dispute_description": dispute_description,
+                "billing_evidence": records,
+                "deterministic_calculation": calculation,
+            }),
+        },
+    ]
+    try:
+        response = _try_parse_json(_call_llm(messages))
+    except (RuntimeError, requests.RequestException, KeyError, TypeError, ValueError) as error:
+        if isinstance(error, requests.HTTPError) and error.response is not None:
+            logger.warning("Billing AI request failed with HTTP %s", error.response.status_code)
+        else:
+            logger.warning("Billing AI request failed: %s", type(error).__name__)
+        return "unavailable", None
+
+    if not isinstance(response, dict):
+        logger.warning("Billing AI response was not a JSON object")
+        return "unavailable", None
+    summary = response.get("summary")
+    summary_citations = response.get("summary_citations")
+    causes = response.get("possible_causes")
+    questions = response.get("follow_up_questions")
+    if not isinstance(summary, str) or not summary.strip() or not isinstance(summary_citations, list):
+        logger.warning("Billing AI response is missing a valid summary or citations")
+        return "unavailable", None
+    if not summary_citations or any(
+        not isinstance(source, str) or source not in source_ids for source in summary_citations
+    ):
+        logger.warning("Billing AI response contains missing or unknown summary citations")
+        return "unavailable", None
+    if not isinstance(causes, list) or not isinstance(questions, list):
+        logger.warning("Billing AI response is missing causes or follow-up questions")
+        return "unavailable", None
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("explanation"), str)
+        or not item.get("explanation", "").strip()
+        or item.get("category") not in {"calculation_error", "contract_interpretation", "other"}
+        or not isinstance(item.get("citations"), list)
+        or not item["citations"]
+        or any(
+            not isinstance(source, str) or source not in source_ids
+            for source in item["citations"]
+        )
+        for item in causes
+    ):
+        logger.warning("Billing AI response contains an invalid cause or citation")
+        return "unavailable", None
+    if any(not isinstance(question, str) for question in questions):
+        logger.warning("Billing AI response contains an invalid follow-up question")
+        return "unavailable", None
+
+    return "complete", {
+        "summary": summary.strip(),
+        "summary_citations": summary_citations,
+        "possible_causes": causes,
+        "follow_up_questions": questions,
+    }
 
 
 if __name__ == "__main__":

@@ -1,83 +1,139 @@
-"""
-disputes.py
+"""Invoice-case lifecycle endpoints and deterministic billing reconciliation."""
 
-Core dispute lifecycle endpoints: create a dispute, submit evidence (parsed
-via the Mistral LLM), check status, resolve (the rule-engine + model +
-explainability pipeline), and fetch the resulting decision.
-"""
-
-from typing import List
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
-from backend.models.db_models import Decision, Dispute, Evidence
+from backend.models.db_models import (
+    BillingCalculation,
+    BillingEvidence,
+    CaseAnalysis,
+    Dispute,
+    Evidence,
+    MockAdjustment,
+    ReviewerAction,
+)
 from backend.models.schemas import (
-    DecisionOut,
     DisputeCreate,
     DisputeOut,
-    EvidenceCreate,
-    EvidenceOut,
+    BillingEvidenceCreate,
+    BillingEvidenceOut,
+    MockAdjustmentCreate,
+    ReviewerActionCreate,
     StatusOut,
 )
-from backend.services import evidence_signals, llm_parser, ml_service, rule_engine
+from backend.services import billing_analysis, llm_parser
 
 router = APIRouter(prefix="/disputes", tags=["disputes"])
 
-# Confidence routing thresholds (percent).
-AUTO_REJECT_BELOW = 20
-AUTO_APPROVE_ABOVE = 85
+def _reconciliation_is_stale(db: Session, dispute_id: int, calculation: BillingCalculation | None) -> bool:
+    if calculation is None:
+        return False
+    latest_billing_id = (
+        db.query(BillingEvidence.id)
+        .filter(BillingEvidence.dispute_id == dispute_id)
+        .order_by(BillingEvidence.id.desc())
+        .limit(1)
+        .scalar()
+    ) or 0
+    latest_evidence_id = (
+        db.query(Evidence.id)
+        .filter(Evidence.dispute_id == dispute_id)
+        .order_by(Evidence.id.desc())
+        .limit(1)
+        .scalar()
+    ) or 0
+    return (
+        latest_billing_id > calculation.result.get("evidence_high_watermark", 0)
+        or latest_evidence_id > calculation.result.get("traditional_evidence_high_watermark", 0)
+    )
+
+
+def _case_status(dispute: Dispute, calculation: BillingCalculation | None, stale: bool) -> str:
+    if (
+        dispute.status == "pending_review"
+        and calculation is not None
+        and not stale
+        and not calculation.result.get("complete", False)
+    ):
+        return "awaiting_information"
+    return dispute.status
+
+
+def _cached_interpretation_is_current(
+    calculation: BillingCalculation | None,
+    analysis: CaseAnalysis | None,
+    current_calculation: dict,
+    evidence_high_watermark: int,
+    traditional_evidence_high_watermark: int,
+) -> dict | None:
+    if (
+        calculation is None
+        or analysis is None
+        or analysis.agent_status not in {"complete", "cached"}
+        or not analysis.agent_interpretation
+        or calculation.result.get("evidence_high_watermark") != evidence_high_watermark
+        or calculation.result.get("traditional_evidence_high_watermark")
+        != traditional_evidence_high_watermark
+    ):
+        return None
+
+    previous_calculation = dict(calculation.result)
+    previous_calculation.pop("evidence_high_watermark", None)
+    previous_calculation.pop("traditional_evidence_high_watermark", None)
+    if previous_calculation != current_calculation:
+        return None
+    return analysis.agent_interpretation
+
+
+def _adjustment_response(adjustment: MockAdjustment) -> dict:
+    return {
+        "id": adjustment.id,
+        "dispute_id": adjustment.dispute_id,
+        "amount": f"{Decimal(adjustment.amount_cents) / 100:.2f}",
+        "reason": adjustment.reason,
+        "approved_by": adjustment.approved_by,
+        "created_at": adjustment.created_at,
+    }
+
+
+def _billing_evidence_response(evidence: BillingEvidence, duplicate_ignored: bool = False) -> dict:
+    return {
+        "id": evidence.id,
+        "dispute_id": evidence.dispute_id,
+        "evidence_type": evidence.evidence_type,
+        "submitted_by": evidence.submitted_by,
+        "payload": evidence.payload,
+        "created_at": evidence.created_at,
+        "duplicate_ignored": duplicate_ignored,
+    }
 
 
 @router.post("", response_model=DisputeOut)
 def create_dispute(payload: DisputeCreate, db: Session = Depends(get_db)):
-    if payload.reason_code not in rule_engine.REQUIRED_EVIDENCE:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unknown reason_code '{payload.reason_code}'. "
-                f"Expected one of {list(rule_engine.REQUIRED_EVIDENCE.keys())}"
-            ),
-        )
-
     dispute = Dispute(
-        card_member_id=payload.card_member_id,
-        merchant_id=payload.merchant_id,
-        reason_code=payload.reason_code,
+        card_member_id=payload.customer_id,
+        merchant_id="invoice_case",
+        reason_code="invoice_dispute",
         amount=payload.amount,
         status="open",
     )
     db.add(dispute)
     db.commit()
     db.refresh(dispute)
+    if payload.description and payload.description.strip():
+        db.add(Evidence(
+            dispute_id=dispute.id,
+            submitted_by="customer",
+            evidence_type="customer_dispute_description",
+            raw_text=payload.description.strip(),
+            parsed_fields=None,
+        ))
+        db.commit()
     return dispute
-
-
-@router.post("/{dispute_id}/evidence", response_model=EvidenceOut)
-def submit_evidence(dispute_id: int, payload: EvidenceCreate, db: Session = Depends(get_db)):
-    dispute = db.get(Dispute, dispute_id)
-    if dispute is None:
-        raise HTTPException(status_code=404, detail="Dispute not found")
-
-    try:
-        parsed_fields = llm_parser.parse_evidence(payload.raw_text)
-    except RuntimeError as e:
-        # Mistral API not configured / reachable -- don't fail the whole
-        # request, just store the evidence without parsed fields.
-        parsed_fields = {"parse_error": True, "raw_response": str(e)}
-
-    evidence = Evidence(
-        dispute_id=dispute_id,
-        submitted_by=payload.submitted_by,
-        evidence_type=payload.evidence_type,
-        raw_text=payload.raw_text,
-        parsed_fields=parsed_fields,
-    )
-    db.add(evidence)
-    db.commit()
-    db.refresh(evidence)
-    return evidence
 
 
 @router.get("/{dispute_id}/status", response_model=StatusOut)
@@ -86,190 +142,367 @@ def get_dispute_status(dispute_id: int, db: Session = Depends(get_db)):
     if dispute is None:
         raise HTTPException(status_code=404, detail="Dispute not found")
 
-    evidence_count = (
-        db.query(Evidence).filter(Evidence.dispute_id == dispute_id).count()
+    billing_count = db.query(BillingEvidence).filter(BillingEvidence.dispute_id == dispute_id).count()
+    latest_calculation = (
+        db.query(BillingCalculation)
+        .filter(BillingCalculation.dispute_id == dispute_id)
+        .order_by(BillingCalculation.created_at.desc(), BillingCalculation.id.desc())
+        .first()
     )
-    return StatusOut(dispute_id=dispute_id, status=dispute.status, evidence_count=evidence_count)
+    stale = _reconciliation_is_stale(db, dispute_id, latest_calculation)
+    return StatusOut(
+        dispute_id=dispute_id,
+        status=_case_status(dispute, latest_calculation, stale),
+        billing_evidence_count=billing_count,
+        reconciliation_stale=stale,
+    )
 
 
-def _build_feature_vector(
-    db: Session, dispute: Dispute, evidence_list: List[Evidence], evidence_completeness_pct: float
-) -> dict:
-    """Reconstruct the model's raw feature vector from stored/parsed
-    evidence, with sensible defaults for anything not yet captured.
+@router.post("/{dispute_id}/billing-evidence", response_model=BillingEvidenceOut)
+def submit_billing_evidence(
+    dispute_id: int, payload: BillingEvidenceCreate, db: Session = Depends(get_db)
+):
+    dispute = db.get(Dispute, dispute_id)
+    if dispute is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    try:
+        normalized = billing_analysis.normalize_evidence(payload.evidence_type, payload.data)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
-    has_tracking: True only if at least one evidence item has a
-    tracking_number that (a) passes a plausibility check -- rejects
-    empty/placeholder/garbage values like "wrong", "123456", "n/a" via
-    evidence_signals.is_plausible_tracking_number, including a check for
-    "this tracking number is wrong" language elsewhere in the same
-    evidence's raw_text -- and (b) isn't contradicted by a delivery_status
-    that indicates the package was NOT actually delivered (e.g. "in
-    transit", "lost", "returned to sender"). A tracking number that proves
-    non-delivery supports the card member's case, not the merchant's, so
-    it must not set has_tracking = True.
-
-    has_signature_confirmation: prefers the LLM's explicit
-    signature_confirmation field (from any submitter); if that field is
-    null/missing (LLM not configured, parse failure, or field simply not
-    extracted), falls back to keyword detection over that evidence's
-    raw_text + delivery_status via evidence_signals.
-
-    merchant_policy_compliance: same idea, but only evidence submitted by
-    the merchant (submitted_by == "merchant") is considered, since this
-    signal is specifically about the merchant's own conduct.
-    """
-
-    has_tracking = False
-    has_signature_confirmation = False
-    merchant_policy_compliance = False
-
-    for ev in evidence_list:
-        fields = ev.parsed_fields if isinstance(ev.parsed_fields, dict) else {}
-
-        # --- Tracking: must be a plausible number AND not contradicted by
-        # a "not actually delivered" status. ---
-        tracking_number = fields.get("tracking_number")
-        delivery_status = fields.get("delivery_status")
-        if evidence_signals.is_plausible_tracking_number(tracking_number, ev.raw_text or ""):
-            if evidence_signals.is_delivery_confirmed(delivery_status):
-                has_tracking = True
-
-        # --- Signature / delivery confirmation ---
-        explicit_signature = fields.get("signature_confirmation")
-        if explicit_signature is True:
-            has_signature_confirmation = True
-        elif explicit_signature is None:
-            text_to_scan = " ".join(
-                part for part in [ev.raw_text, delivery_status] if isinstance(part, str)
+    if payload.evidence_type == "invoice_line_item":
+        existing_lines = (
+            db.query(BillingEvidence)
+            .filter(
+                BillingEvidence.dispute_id == dispute_id,
+                BillingEvidence.evidence_type == "invoice_line_item",
             )
-            if evidence_signals.detect_signature_confirmation(text_to_scan):
-                has_signature_confirmation = True
-        # explicit_signature is False -> LLM found an explicit "no signature"
-        # signal; treat as authoritative and don't fall back to keywords.
+            .order_by(BillingEvidence.id.asc())
+            .all()
+        )
+        same_id = [
+            item for item in existing_lines
+            if item.payload.get("line_id") == normalized["line_id"]
+        ]
+        if same_id:
+            identical = next((item for item in same_id if item.payload == normalized), None)
+            if identical:
+                return _billing_evidence_response(identical, duplicate_ignored=True)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Invoice line ID '{normalized['line_id']}' already has different evidence. "
+                    "Add supporting contract or usage evidence instead of a second invoice line."
+                ),
+            )
 
-        # --- Merchant policy compliance (merchant-submitted evidence only) ---
-        if ev.submitted_by == "merchant":
-            explicit_compliance = fields.get("policy_compliance")
-            if explicit_compliance is True:
-                merchant_policy_compliance = True
-            elif explicit_compliance is None:
-                if evidence_signals.detect_policy_compliance(ev.raw_text or ""):
-                    merchant_policy_compliance = True
-
-    # We do have real history for this: count the card member's other disputes.
-    dispute_history_count = (
-        db.query(Dispute)
-        .filter(Dispute.card_member_id == dispute.card_member_id, Dispute.id != dispute.id)
-        .count()
+    evidence = BillingEvidence(
+        dispute_id=dispute_id,
+        evidence_type=payload.evidence_type,
+        submitted_by=payload.submitted_by,
+        payload=normalized,
     )
-    dispute_history_count = min(dispute_history_count, 10)
+    db.add(evidence)
+    if dispute.status in {"resolved", "pending_review", "reviewed", "rejected", "adjusted", "awaiting_information"}:
+        dispute.status = "reopened"
+        db.add(ReviewerAction(
+            dispute_id=dispute_id,
+            action="reopened_by_new_evidence",
+            note="New billing evidence was added after an earlier conclusion.",
+        ))
+    db.commit()
+    db.refresh(evidence)
+    return _billing_evidence_response(evidence)
 
-    # Not yet tracked end-to-end (no merchant response event in the DB yet)
-    # -- sensible neutral default.
-    merchant_response_time_hours = 48.0
 
+@router.get("/{dispute_id}/billing-evidence", response_model=list[BillingEvidenceOut])
+def list_billing_evidence(dispute_id: int, db: Session = Depends(get_db)):
+    if db.get(Dispute, dispute_id) is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return (
+        db.query(BillingEvidence)
+        .filter(BillingEvidence.dispute_id == dispute_id)
+        .order_by(BillingEvidence.id.asc())
+        .all()
+    )
+
+
+@router.post("/{dispute_id}/reconcile")
+def reconcile_billing(dispute_id: int, db: Session = Depends(get_db)):
+    dispute = db.get(Dispute, dispute_id)
+    if dispute is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    evidence = (
+        db.query(BillingEvidence)
+        .filter(BillingEvidence.dispute_id == dispute_id)
+        .order_by(BillingEvidence.id.asc())
+        .all()
+    )
+    description_record = (
+        db.query(Evidence)
+        .filter(
+            Evidence.dispute_id == dispute_id,
+            Evidence.evidence_type == "customer_dispute_description",
+        )
+        .order_by(Evidence.id.desc())
+        .first()
+    )
+    result = billing_analysis.analyze_billing(
+        evidence,
+        description_record.raw_text if description_record else None,
+    )
+    high_watermark = max((item.id for item in evidence), default=0)
+    traditional_high_watermark = (
+        db.query(Evidence.id)
+        .filter(Evidence.dispute_id == dispute_id)
+        .order_by(Evidence.id.desc())
+        .limit(1)
+        .scalar()
+        or 0
+    )
+    agent_status, agent_interpretation = llm_parser.interpret_billing_case(
+        evidence,
+        result["calculation"],
+        description_record.raw_text if description_record else None,
+    )
+    if agent_status == "unavailable":
+        previous_analysis = (
+            db.query(CaseAnalysis)
+            .filter(CaseAnalysis.dispute_id == dispute_id)
+            .filter(CaseAnalysis.agent_status == "complete")
+            .filter(CaseAnalysis.agent_interpretation.isnot(None))
+            .order_by(CaseAnalysis.id.desc())
+            .first()
+        )
+        previous_calculation = (
+            db.get(BillingCalculation, previous_analysis.id)
+            if previous_analysis is not None
+            else None
+        )
+        if previous_calculation and previous_calculation.dispute_id != dispute_id:
+            previous_calculation = None
+        cached_interpretation = _cached_interpretation_is_current(
+            previous_calculation,
+            previous_analysis,
+            result["calculation"],
+            high_watermark,
+            traditional_high_watermark,
+        )
+        if cached_interpretation is not None:
+            agent_status = "cached"
+            agent_interpretation = cached_interpretation
+    result["calculation"]["evidence_high_watermark"] = high_watermark
+    result["calculation"]["traditional_evidence_high_watermark"] = traditional_high_watermark
+    calculation = BillingCalculation(dispute_id=dispute_id, result=result["calculation"])
+    analysis = CaseAnalysis(
+        dispute_id=dispute_id,
+        summary=result["summary"],
+        findings=result["findings"],
+        missing_evidence=result["missing_evidence"],
+        resolution_options=result["resolution_options"],
+        agent_status=agent_status,
+        agent_interpretation=agent_interpretation,
+    )
+    db.add_all([calculation, analysis])
+    dispute.status = "pending_review" if result["calculation"]["complete"] else "awaiting_information"
+    db.commit()
+    db.refresh(calculation)
+    db.refresh(analysis)
     return {
-        "reason_code": dispute.reason_code,
-        "has_tracking": has_tracking,
-        "has_signature_confirmation": has_signature_confirmation,
-        "merchant_response_time_hours": merchant_response_time_hours,
-        "merchant_policy_compliance": merchant_policy_compliance,
-        "card_member_dispute_history_count": dispute_history_count,
-        "evidence_completeness_pct": evidence_completeness_pct,
+        "calculation_id": calculation.id,
+        "analysis_id": analysis.id,
+        "calculation": calculation.result,
+        "analysis": {
+            "summary": analysis.summary,
+            "findings": analysis.findings,
+            "missing_evidence": analysis.missing_evidence,
+            "resolution_options": analysis.resolution_options,
+            "agent_status": analysis.agent_status,
+            "agent_interpretation": analysis.agent_interpretation,
+        },
+        "is_stale": False,
     }
 
 
-@router.post("/{dispute_id}/resolve", response_model=DecisionOut)
-def resolve_dispute(dispute_id: int, db: Session = Depends(get_db)):
-    dispute = db.get(Dispute, dispute_id)
-    if dispute is None:
+@router.get("/{dispute_id}/reconciliation")
+def get_reconciliation(dispute_id: int, db: Session = Depends(get_db)):
+    if db.get(Dispute, dispute_id) is None:
         raise HTTPException(status_code=404, detail="Dispute not found")
-
-    # 1. Load all evidence, aggregate evidence types.
-    evidence_list = db.query(Evidence).filter(Evidence.dispute_id == dispute_id).all()
-    evidence_types = [ev.evidence_type for ev in evidence_list]
-
-    # 2. Evidence completeness via the rule engine.
-    completeness = rule_engine.evidence_completeness(dispute.reason_code, evidence_types)
-    completeness_pct = completeness["completeness_pct"]
-
-    # 3. Build the feature vector.
-    feature_vector = _build_feature_vector(db, dispute, evidence_list, completeness_pct)
-
-    # 4. Predict outcome + probability.
-    prediction = ml_service.predict_outcome(feature_vector)
-    outcome = prediction["outcome"]
-    confidence_pct = prediction["confidence_pct"]
-
-    # 5. Explainability.
-    shap_explanation = ml_service.get_shap_explanation(feature_vector)
-    counterfactual = ml_service.get_counterfactual(feature_vector)
-
-    if counterfactual["changed"]:
-        counterfactual_text = (
-            f"Flipping '{counterfactual['feature_flipped']}' from "
-            f"{counterfactual['flipped_from']} to {counterfactual['flipped_to']} "
-            f"would change the outcome to '{counterfactual['new_outcome']}'."
-        )
-    else:
-        counterfactual_text = "No single feature flip changes the predicted outcome."
-
-    top_feat_summary = "; ".join(
-        f"{f['feature']} ({f['direction']})" for f in shap_explanation["top_features"]
-    )
-    missing_str = ", ".join(completeness["missing"]) if completeness["missing"] else "none"
-    reasoning_text = (
-        f"Predicted '{outcome}' with {confidence_pct}% confidence. "
-        f"Evidence completeness: {completeness_pct}% (missing: {missing_str}). "
-        f"Top factors: {top_feat_summary}."
-    )
-
-    # 6. Confidence routing.
-    if confidence_pct < AUTO_REJECT_BELOW:
-        human_reviewed = False
-        new_status = "resolved"
-    elif confidence_pct <= AUTO_APPROVE_ABOVE:
-        human_reviewed = True
-        new_status = "pending_review"
-    else:
-        human_reviewed = False
-        new_status = "resolved"
-
-    # 7. Save the Decision, update Dispute status.
-    decision = Decision(
-        dispute_id=dispute_id,
-        outcome=outcome,
-        confidence_score=confidence_pct,
-        shap_explanation=shap_explanation,
-        counterfactual_text=counterfactual_text,
-        evidence_completeness_pct=completeness_pct,
-        human_reviewed=human_reviewed,
-        reasoning_text=reasoning_text,
-    )
-    db.add(decision)
-
-    dispute.status = new_status
-    db.add(dispute)
-
-    db.commit()
-    db.refresh(decision)
-    return decision
-
-
-@router.get("/{dispute_id}/decision", response_model=DecisionOut)
-def get_decision(dispute_id: int, db: Session = Depends(get_db)):
-    dispute = db.get(Dispute, dispute_id)
-    if dispute is None:
-        raise HTTPException(status_code=404, detail="Dispute not found")
-
-    decision = (
-        db.query(Decision)
-        .filter(Decision.dispute_id == dispute_id)
-        .order_by(Decision.created_at.desc())
+    calculation = (
+        db.query(BillingCalculation)
+        .filter(BillingCalculation.dispute_id == dispute_id)
+        .order_by(BillingCalculation.created_at.desc(), BillingCalculation.id.desc())
         .first()
     )
-    if decision is None:
-        raise HTTPException(status_code=404, detail="No decision found for this dispute yet")
+    analysis = (
+        db.query(CaseAnalysis)
+        .filter(CaseAnalysis.dispute_id == dispute_id)
+        .order_by(CaseAnalysis.created_at.desc(), CaseAnalysis.id.desc())
+        .first()
+    )
+    if calculation is None or analysis is None:
+        raise HTTPException(status_code=404, detail="No reconciliation found for this dispute")
+    stale = _reconciliation_is_stale(db, dispute_id, calculation)
+    latest_edit = (
+        db.query(ReviewerAction)
+        .filter(ReviewerAction.dispute_id == dispute_id, ReviewerAction.action == "edit")
+        .order_by(ReviewerAction.id.desc())
+        .first()
+    )
+    effective_findings = analysis.findings
+    if (
+        not stale
+        and latest_edit
+        and latest_edit.edited_findings is not None
+        and latest_edit.created_at >= analysis.created_at
+    ):
+        effective_findings = latest_edit.edited_findings
+    return {
+        "calculation_id": calculation.id,
+        "analysis_id": analysis.id,
+        "calculation": calculation.result,
+        "analysis": {
+            "summary": analysis.summary,
+            "findings": effective_findings,
+            "missing_evidence": analysis.missing_evidence,
+            "resolution_options": analysis.resolution_options,
+            "agent_status": analysis.agent_status,
+            "agent_interpretation": analysis.agent_interpretation,
+        },
+        "is_stale": stale,
+    }
 
-    return decision
+
+@router.post("/{dispute_id}/review")
+def review_case(dispute_id: int, payload: ReviewerActionCreate, db: Session = Depends(get_db)):
+    dispute = db.get(Dispute, dispute_id)
+    if dispute is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    if payload.action in {"accept", "edit", "reject"}:
+        latest_calculation = (
+            db.query(BillingCalculation)
+            .filter(BillingCalculation.dispute_id == dispute_id)
+            .order_by(BillingCalculation.id.desc())
+            .first()
+        )
+        if latest_calculation is None:
+            raise HTTPException(status_code=409, detail="Reconcile the invoice before reviewing findings")
+        if _reconciliation_is_stale(db, dispute_id, latest_calculation):
+            raise HTTPException(status_code=409, detail="New evidence was added; reconcile again before reviewing")
+        if not latest_calculation.result.get("complete", False):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Required invoice and pricing or usage evidence is missing; "
+                    "request information before accepting, editing, or rejecting findings"
+                ),
+            )
+    action = ReviewerAction(
+        dispute_id=dispute_id,
+        action=payload.action,
+        note=payload.note,
+        edited_findings=payload.edited_findings,
+    )
+    dispute.status = {
+        "accept": "reviewed",
+        "edit": "reviewed",
+        "reject": "rejected",
+        "request_information": "awaiting_information",
+    }[payload.action]
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return {"id": action.id, "action": action.action, "status": dispute.status, "created_at": action.created_at}
+
+
+@router.post("/{dispute_id}/adjustments")
+def approve_mock_adjustment(
+    dispute_id: int, payload: MockAdjustmentCreate, db: Session = Depends(get_db)
+):
+    dispute = db.get(Dispute, dispute_id)
+    if dispute is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    if not payload.amount.is_finite() or payload.amount <= 0 or payload.amount != payload.amount.quantize(Decimal("0.01")):
+        raise HTTPException(status_code=422, detail="amount must be positive and have at most two decimal places")
+    existing = db.query(MockAdjustment).filter(MockAdjustment.dispute_id == dispute_id).first()
+    if existing:
+        if (
+            existing.amount_cents == int(payload.amount * 100)
+            and existing.reason == payload.reason
+            and existing.approved_by == payload.approved_by
+        ):
+            return _adjustment_response(existing)
+        raise HTTPException(status_code=409, detail="A mock adjustment has already been approved for this dispute")
+    calculation = (
+        db.query(BillingCalculation)
+        .filter(BillingCalculation.dispute_id == dispute_id)
+        .order_by(BillingCalculation.id.desc())
+        .first()
+    )
+    if calculation is None or not calculation.result.get("complete"):
+        raise HTTPException(status_code=409, detail="A complete invoice reconciliation is required before approving an adjustment")
+    if _reconciliation_is_stale(db, dispute_id, calculation):
+        raise HTTPException(status_code=409, detail="New evidence was added; reconcile again before approving an adjustment")
+    difference = max(
+        Decimal(calculation.result["invoice_total"]) - Decimal(calculation.result["recalculated_total"]),
+        Decimal("0.00"),
+    )
+    if payload.amount > difference:
+        raise HTTPException(status_code=422, detail=f"Adjustment cannot exceed the verified overcharge of {difference:.2f}")
+    adjustment = MockAdjustment(
+        dispute_id=dispute_id,
+        amount_cents=int(payload.amount * 100),
+        reason=payload.reason,
+        approved_by=payload.approved_by,
+    )
+    db.add(adjustment)
+    db.add(ReviewerAction(
+        dispute_id=dispute_id,
+        action="approve_adjustment",
+        note=f"Approved mock adjustment of {payload.amount:.2f}: {payload.reason}",
+    ))
+    dispute.status = "adjusted"
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.query(MockAdjustment).filter(MockAdjustment.dispute_id == dispute_id).first()
+        if existing and (
+            existing.amount_cents == int(payload.amount * 100)
+            and existing.reason == payload.reason
+            and existing.approved_by == payload.approved_by
+        ):
+            return _adjustment_response(existing)
+        raise HTTPException(status_code=409, detail="A mock adjustment has already been approved for this dispute")
+    db.refresh(adjustment)
+    return _adjustment_response(adjustment)
+
+
+@router.post("/{dispute_id}/reopen")
+def reopen_case(dispute_id: int, note: str = "New evidence or reconsideration", db: Session = Depends(get_db)):
+    dispute = db.get(Dispute, dispute_id)
+    if dispute is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    dispute.status = "reopened"
+    action = ReviewerAction(dispute_id=dispute_id, action="reopen", note=note)
+    db.add(action)
+    db.commit()
+    return {"dispute_id": dispute_id, "status": dispute.status}
+
+
+@router.get("/{dispute_id}/history")
+def get_case_history(dispute_id: int, db: Session = Depends(get_db)):
+    if db.get(Dispute, dispute_id) is None:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    actions = db.query(ReviewerAction).filter(ReviewerAction.dispute_id == dispute_id).order_by(ReviewerAction.id.asc()).all()
+    calculations = db.query(BillingCalculation).filter(BillingCalculation.dispute_id == dispute_id).order_by(BillingCalculation.id.asc()).all()
+    analyses = db.query(CaseAnalysis).filter(CaseAnalysis.dispute_id == dispute_id).order_by(CaseAnalysis.id.asc()).all()
+    adjustments = db.query(MockAdjustment).filter(MockAdjustment.dispute_id == dispute_id).order_by(MockAdjustment.id.asc()).all()
+    return {
+        "reviewer_actions": actions,
+        "calculations": calculations,
+        "analyses": analyses,
+        "adjustments": adjustments,
+    }
+
+

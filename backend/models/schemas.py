@@ -7,64 +7,68 @@ independently of storage.
 """
 
 from datetime import datetime
-from typing import Any, Optional
+from decimal import Decimal
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DisputeCreate(BaseModel):
-    card_member_id: str
-    merchant_id: str
-    reason_code: str
+    customer_id: str
     amount: float
+    description: Optional[str] = None
 
 
 class DisputeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    card_member_id: str
-    merchant_id: str
+    customer_id: str = Field(validation_alias="card_member_id")
     reason_code: str
     amount: float
     status: str
     created_at: datetime
 
 
-class EvidenceCreate(BaseModel):
-    evidence_type: str
-    raw_text: str
-    submitted_by: str = "card_member"
-
-
-class EvidenceOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    dispute_id: int
-    submitted_by: str
-    evidence_type: str
-    raw_text: Optional[str] = None
-    parsed_fields: Optional[Any] = None
-    uploaded_at: datetime
-
-
 class StatusOut(BaseModel):
     dispute_id: int
     status: str
-    evidence_count: int
+    billing_evidence_count: int = 0
+    reconciliation_stale: bool = False
 
 
-class DecisionOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class BillingEvidenceCreate(BaseModel):
+    evidence_type: Literal["invoice_line_item", "contract_rule", "usage_event", "payment_adjustment"]
+    data: dict[str, Any]
+    submitted_by: Literal["customer", "reviewer"] = "customer"
 
+
+class BillingEvidenceOut(BaseModel):
     id: int
     dispute_id: int
-    outcome: str
-    confidence_score: float
-    shap_explanation: Optional[Any] = None
-    counterfactual_text: Optional[str] = None
-    evidence_completeness_pct: Optional[float] = None
-    human_reviewed: bool
-    reasoning_text: Optional[str] = None
+    evidence_type: str
+    submitted_by: str
+    payload: Any
+    created_at: datetime
+    duplicate_ignored: bool = False
+
+
+class ReviewerActionCreate(BaseModel):
+    action: Literal["accept", "edit", "reject", "request_information"]
+    note: Optional[str] = None
+    edited_findings: Optional[list[dict[str, Any]]] = None
+
+
+class MockAdjustmentCreate(BaseModel):
+    amount: Decimal
+    reason: str
+    approved_by: str = "reviewer"
+
+
+class MockAdjustmentOut(BaseModel):
+    id: int
+    dispute_id: int
+    amount: Decimal
+    reason: str
+    approved_by: str
     created_at: datetime

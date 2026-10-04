@@ -56,16 +56,7 @@ pnpm-debug.log*
 Thumbs.db
 
 # ---- Local SQLite dev database ----
+dev.db
+dev.db-journal
 backend/*.db
 backend/*.db-journal
-
-# ---- ML artifacts (generated data/models; scripts in ml/ are still tracked) ----
-ml/*.csv
-ml/*.parquet
-ml/*.pkl
-ml/*.h5
-ml/*.ckpt
-ml/model.json
-ml/feature_order.json
-ml/data/
-ml/checkpoints/

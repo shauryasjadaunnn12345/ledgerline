@@ -7,12 +7,22 @@ const STATUS_LABELS = {
   open: "Open",
   resolved: "Resolved",
   pending_review: "Pending Human Review",
+  awaiting_information: "Awaiting Information",
+  reopened: "Reopened",
+  reviewed: "Reviewed",
+  rejected: "Rejected",
+  adjusted: "Adjustment Approved",
 };
 
 const STATUS_STYLES = {
   open: "bg-gray-100 text-gray-700",
-  resolved: "bg-green-100 text-green-700",
-  pending_review: "bg-amber-100 text-amber-700",
+  resolved: "bg-emerald-50 text-emerald-800",
+  pending_review: "bg-amber-50 text-amber-800",
+  awaiting_information: "bg-orange-50 text-orange-800",
+  reopened: "bg-sky-50 text-sky-800",
+  reviewed: "bg-emerald-50 text-emerald-800",
+  rejected: "bg-rose-50 text-rose-800",
+  adjusted: "bg-emerald-50 text-emerald-800",
 };
 
 function StatusTracker({ disputeId, refreshKey }) {
@@ -50,18 +60,24 @@ function StatusTracker({ disputeId, refreshKey }) {
   if (!disputeId) return null;
 
   return (
-    <div className="bg-white rounded-xl border border-gray-200 p-5">
-      <h2 className="text-base font-semibold text-gray-900 mb-3">Dispute Status</h2>
-      {error && <p className="text-sm text-red-600 mb-2">{error}</p>}
+    <div className="status-card">
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <div>
+          <p className="eyebrow">Case overview</p>
+          <h2 className="mt-1 text-base font-semibold text-gray-950">Invoice case status</h2>
+        </div>
+        <span className="status-live"><span />Live</span>
+      </div>
+      {error && <p className="mb-2 text-sm text-red-600">{error}</p>}
       {status ? (
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-gray-500">Dispute #{status.dispute_id}</span>
-          <div className="flex items-center gap-4">
-            <span className="text-gray-600">
-              Evidence submitted: <strong>{status.evidence_count}</strong>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <span className="text-sm font-medium text-gray-600">Dispute <strong className="font-semibold text-gray-900">#{status.dispute_id}</strong></span>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm text-gray-500">
+              <strong className="font-semibold text-gray-900">{status.billing_evidence_count}</strong> billing records
             </span>
             <span
-              className={`px-2.5 py-1 rounded-full text-xs font-medium ${
+              className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
                 STATUS_STYLES[status.status] || "bg-gray-100 text-gray-700"
               }`}
             >
@@ -70,7 +86,7 @@ function StatusTracker({ disputeId, refreshKey }) {
           </div>
         </div>
       ) : (
-        <p className="text-sm text-gray-500">Loading status...</p>
+        <p className="text-sm text-gray-500">Loading case status…</p>
       )}
     </div>
   );

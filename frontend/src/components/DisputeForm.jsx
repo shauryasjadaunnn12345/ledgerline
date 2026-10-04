@@ -1,13 +1,11 @@
 import { useState } from "react";
 import { createDispute } from "../api";
-import { REASON_CODES } from "../constants";
 
 function DisputeForm({ onCreated }) {
   const [form, setForm] = useState({
-    card_member_id: "",
-    merchant_id: "",
-    reason_code: REASON_CODES[0].value,
+    customer_id: "",
     amount: "",
+    description: "",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -23,10 +21,9 @@ function DisputeForm({ onCreated }) {
     setLoading(true);
     try {
       const dispute = await createDispute({
-        card_member_id: form.card_member_id,
-        merchant_id: form.merchant_id,
-        reason_code: form.reason_code,
+        customer_id: form.customer_id,
         amount: parseFloat(form.amount),
+        description: form.description,
       });
       onCreated(dispute);
       setForm((f) => ({ ...f, amount: "" }));
@@ -38,52 +35,28 @@ function DisputeForm({ onCreated }) {
   };
 
   return (
-    <div className="bg-white rounded-xl border border-gray-200 p-5">
-      <h2 className="text-base font-semibold text-gray-900 mb-4">File a New Dispute</h2>
-      <form onSubmit={handleSubmit} className="space-y-3">
+    <div className="dispute-form-card">
+      <div className="mb-5">
+        <p className="eyebrow">New case</p>
+        <h2 className="mt-1 text-lg font-semibold tracking-tight text-gray-950">Open an invoice dispute</h2>
+        <p className="mt-1 text-sm text-gray-500">Start with the account and amount shown on the invoice.</p>
+      </div>
+      <form onSubmit={handleSubmit} className="space-y-4">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Card Member ID
+            Customer ID
           </label>
           <input
-            name="card_member_id"
-            value={form.card_member_id}
+            name="customer_id"
+            value={form.customer_id}
             onChange={handleChange}
             required
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            placeholder="cm_123"
+            className="app-input w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm"
+            placeholder="customer-123"
           />
         </div>
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Merchant ID
-          </label>
-          <input
-            name="merchant_id"
-            value={form.merchant_id}
-            onChange={handleChange}
-            required
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            placeholder="merch_456"
-          />
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Reason</label>
-          <select
-            name="reason_code"
-            value={form.reason_code}
-            onChange={handleChange}
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-          >
-            {REASON_CODES.map((r) => (
-              <option key={r.value} value={r.value}>
-                {r.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Amount ($)</label>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Disputed invoice amount ($)</label>
           <input
             name="amount"
             type="number"
@@ -92,17 +65,28 @@ function DisputeForm({ onCreated }) {
             value={form.amount}
             onChange={handleChange}
             required
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            className="app-input w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm"
             placeholder="89.99"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Customer dispute description</label>
+          <textarea
+            name="description"
+            value={form.description}
+            onChange={handleChange}
+            rows={3}
+            className="app-input w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm"
+            placeholder="Describe the disputed invoice charge or unexpected balance"
           />
         </div>
         {error && <p className="text-sm text-red-600">{error}</p>}
         <button
           type="submit"
           disabled={loading}
-          className="w-full bg-indigo-600 text-white text-sm font-medium rounded-lg px-4 py-2 hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+          className="app-button w-full bg-emerald-700 text-white text-sm font-semibold rounded-lg px-4 py-3 hover:bg-emerald-800 disabled:opacity-50 transition-colors"
         >
-          {loading ? "Creating..." : "Create Dispute"}
+          {loading ? "Creating..." : "Open invoice case"}
         </button>
       </form>
     </div>
